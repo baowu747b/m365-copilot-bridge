@@ -13,6 +13,7 @@ services:
       M365_API_KEYS: /data/api-keys.json
       M365_CHAT_TIMEOUT_SECONDS: "120"
       M365_IMAGE_TIMEOUT_SECONDS: "150"
+      M365_LOG_LEVEL: "silent"
     volumes:
       - ./data:/data
       - ./secrets/m365_admin_password:/run/secrets/m365_admin_password:ro
