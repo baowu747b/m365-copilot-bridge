@@ -48,6 +48,7 @@ type Server struct {
 	statsDirty         bool
 	accountPool        *accountHealth
 	accountPoolOnce    sync.Once
+	metrics            *telemetry
 }
 
 func New() (*Server, error) {
@@ -76,6 +77,7 @@ func New() (*Server, error) {
 	s.loadStats()
 	go s.statsSaver()
 	go s.apiKeys.saver() // P2: periodic flush, avoid per-request disk write under lock
+	s.metrics = &telemetry{}
 	return s, nil
 }
 
@@ -98,6 +100,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/test-proxy", s.testProxy)
 	m.HandleFunc("/api/admin/test-all-proxies", s.testAllProxies)
 	m.HandleFunc("/api/admin/reset-stats", s.resetStatsHandler)
+	m.HandleFunc("/api/admin/usage", s.adminUsage)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
 	m.HandleFunc("/api/chat", s.chatOnce)
@@ -883,6 +886,7 @@ type chatBody struct {
 	ConversationID string               `json:"conversationId"`
 	SessionID      string               `json:"sessionId"`
 	SessionKey     string               `json:"sessionKey"`
+	ContentKey     string               `json:"content_key"`
 	Attachments    []chathub.Attachment `json:"attachments,omitempty"`
 	Tools          []chathub.Tool       `json:"tools,omitempty"`
 	// Legacy OpenAI-compatible clients still send functions/function_call.
@@ -933,6 +937,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
 	var body chatBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
@@ -967,6 +972,29 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Opt-in content-key session reuse: identical content sent repeatedly can
+	// reuse the same ChatHub conversation and benefit from M365's own context
+	// reuse. Skipped when an explicit sessionKey (multi-turn thread) is present.
+	reuseHit := false
+	if body.ContentKey != "" && body.SessionKey == "" {
+		if v, ok := s.sessions.getByContentKey(acc.ID, body.ContentKey); ok {
+			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
+			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
+			reuseHit = true
+		}
+	}
+	// Telemetry: record once when the request settles. Live variables (warm,
+	// chatStatus, tokens) are captured by reference so values set below are
+	// observed at function exit.
+	warm := false
+	chatStatus := 200
+	var inTok, outTok int64
+	defer func() {
+		if s.metrics != nil {
+			s.metrics.record(chatStatus, time.Since(start).Milliseconds(), "m365-copilot", acc.ID, inTok, outTok, warm, reuseHit, body.ContentKey != "" && !reuseHit)
+		}
+	}()
+
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
 	req := chathub.Request{
@@ -989,17 +1017,22 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			s.markAccountResult(acc.ID, err)
+			chatStatus = http.StatusBadGateway
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 	}
 	s.markAccountResult(acc.ID, nil)
 	s.recordTokens(acc.ID, text, res.FullText)
+	warm = res.WarmHit
+	inTok, outTok = estimateChatUsage("m365-copilot", []any{map[string]any{"role": "user", "content": text}}, nil, res.FullText)
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}
 	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
+		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text, ContentKey: body.ContentKey})
+	} else if body.ContentKey != "" {
+		s.sessions.upsert(conversation{AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text, ContentKey: body.ContentKey})
 	}
 	jsonOut(w, map[string]any{
 		"status":         "ok",
@@ -1046,6 +1079,7 @@ type oaiReq struct {
 	ConversationID string               `json:"conversation_id"`
 	SessionID      string               `json:"session_id"`
 	SessionKey     string               `json:"session_key"`
+	ContentKey     string               `json:"content_key"`
 	Attachments    []chathub.Attachment `json:"attachments,omitempty"`
 	Tools          []chathub.Tool       `json:"tools,omitempty"`
 	// Legacy OpenAI-compatible clients still send functions/function_call.
@@ -1141,6 +1175,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	start := time.Now()
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
@@ -1209,6 +1244,26 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Opt-in content-key session reuse (same semantics as chatOnce): identical
+	// content reused across requests can reuse the same ChatHub conversation.
+	reuseHit := false
+	if body.ContentKey != "" && body.SessionKey == "" {
+		if v, ok := s.sessions.getByContentKey(acc.ID, body.ContentKey); ok {
+			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
+			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
+			reuseHit = true
+		}
+	}
+	// Telemetry: capture live variables (warm/chatStatus/tokens) by reference.
+	warm := false
+	chatStatus := 200
+	var inTok, outTok int64
+	defer func() {
+		if s.metrics != nil {
+			s.metrics.record(chatStatus, time.Since(start).Milliseconds(), firstNonEmpty(body.Model, "m365-copilot"), acc.ID, inTok, outTok, warm, reuseHit, body.ContentKey != "" && !reuseHit)
+		}
+	}()
+
 	// Normalize tools once. Selection is always made by the upstream model;
 	// the gateway only validates its structured decision and converts protocols.
 	toolMaps := make([]map[string]any, 0, len(body.Tools))
@@ -1240,6 +1295,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chat.Chat(ctx, account, chathub.Request{Text: routePrompt, Tone: tone})
 		if routeErr != nil {
+			chatStatus = http.StatusBadGateway
 			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
 			return
 		}
@@ -1336,6 +1392,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chat.Chat(ctx, account, chathub.Request{Text: routePrompt, Tone: tone})
 		if routeErr != nil {
+			chatStatus = http.StatusBadGateway
 			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
 			return
 		}
@@ -1347,6 +1404,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 			}
 			if !parsed {
+				chatStatus = http.StatusBadGateway
 				http.Error(w, "model returned an invalid tool routing decision", http.StatusBadGateway)
 				return
 			}
@@ -1378,6 +1436,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 			}
+			chatStatus = http.StatusBadGateway
 			http.Error(w, "model did not select a required tool after constrained retry", http.StatusBadGateway)
 			return
 		}
@@ -1448,6 +1507,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if err != nil {
 		s.markAccountResult(acc.ID, err)
+		chatStatus = http.StatusBadGateway
 		if streamed {
 			// Report the upstream failure instead of closing the stream silently.
 			if f, ok := w.(http.Flusher); ok {
@@ -1477,6 +1537,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 		}
 		if err != nil {
+			chatStatus = http.StatusBadGateway
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -1484,8 +1545,29 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	s.markAccountResult(acc.ID, nil)
 	in, out := estimateChatUsage(firstNonEmpty(body.Model, "m365-copilot"), body.Messages, body.Tools, res.FullText)
 	s.addTokens(acc.ID, in, out)
+	warm = res.WarmHit
+	inTok, outTok = in, out
+	if e, ok := r.Context().Value(debugExtraKey).(*debugExtra); ok {
+		i := int(inTok)
+		o := int(outTok)
+		e.InputTokens = &i
+		e.OutputTokens = &o
+		hit := warm || reuseHit
+		e.CacheHit = &hit
+		switch {
+		case warm:
+			e.CacheSource = "warm_tls_pool"
+		case reuseHit:
+			e.CacheSource = "content_reuse"
+		default:
+			e.CacheSource = "none"
+		}
+	}
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
+	}
+	if body.ContentKey != "" {
+		s.sessions.upsert(conversation{AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt, ContentKey: body.ContentKey})
 	}
 	if body.Stream {
 		return

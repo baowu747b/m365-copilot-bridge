@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,6 +13,21 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// debugExtra carries per-request telemetry that the chat handlers compute but
+// the debug middleware can only attach after the handler returns. It is passed
+// through the request context as a pointer so the handler can mutate it and the
+// middleware can read the final values.
+type debugExtra struct {
+	InputTokens  *int
+	OutputTokens *int
+	CacheHit     *bool
+	CacheSource  string
+}
+
+type contextKey string
+
+const debugExtraKey contextKey = "debugExtra"
 
 type debugRecord struct {
 	ID           string    `json:"id"`
@@ -149,11 +165,25 @@ func (s *Server) debugMiddleware(next http.Handler) http.Handler {
 		}
 		in, _ := io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(in))
+		extra := &debugExtra{}
+		r = r.WithContext(context.WithValue(r.Context(), debugExtraKey, extra))
 		cw := &captureWriter{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(cw, r)
 		out := cw.body.Bytes()
 		rec := debugRecord{ID: "dbg_" + uuid.NewString(), At: start, Level: debugLevel(cw.status), Path: r.URL.Path, Method: r.Method, Status: cw.status, DurationMS: time.Since(start).Milliseconds(), TokenSource: "unavailable_from_chathub", CacheSource: "not_reported_by_upstream", Client: redactBody(in), Gateway: redactBody(out), Upstream: map[string]any{"captured": false, "reason": "ChatHub transport tracing not yet attached to request context"}}
+		if extra.InputTokens != nil {
+			rec.InputTokens = extra.InputTokens
+		}
+		if extra.OutputTokens != nil {
+			rec.OutputTokens = extra.OutputTokens
+		}
+		if extra.CacheHit != nil {
+			rec.CacheHit = extra.CacheHit
+		}
+		if extra.CacheSource != "" {
+			rec.CacheSource = extra.CacheSource
+		}
 		s.debug.add(rec)
 	})
 }

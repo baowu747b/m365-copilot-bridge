@@ -15,6 +15,7 @@ type conversation struct {
 	AccountID      string    `json:"accountId"`
 	ConversationID string    `json:"conversationId"`
 	SessionID      string    `json:"sessionId"`
+	ContentKey     string    `json:"contentKey,omitempty"`
 	Title          string    `json:"title,omitempty"`
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
@@ -59,6 +60,40 @@ func (s *sessionStore) get(id string) (conversation, bool) {
 	defer s.mu.Unlock()
 	v, ok := s.data[id]
 	return v, ok
+}
+
+// contentKeyTTL bounds how long a content-key → ChatHub conversation binding
+// stays reusable. Beyond this window the upstream conversation is considered
+// stale and a new one is opened, so the cache self-heals instead of pinning a
+// dead conversation forever.
+const contentKeyTTL = 30 * time.Minute
+
+// getByContentKey returns the most recent conversation bound to (accountID,
+// key) that is still within contentKeyTTL. It is an opt-in, client-supplied
+// reuse key: identical content sent repeatedly can reuse the same ChatHub
+// conversation and benefit from M365's own context/prefix reuse without
+// polluting the per-thread sessionKey mapping.
+func (s *sessionStore) getByContentKey(accountID, key string) (conversation, bool) {
+	if key == "" {
+		return conversation{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best conversation
+	found := false
+	for _, v := range s.data {
+		if v.AccountID != accountID || v.ContentKey != key {
+			continue
+		}
+		if time.Since(v.UpdatedAt) > contentKeyTTL {
+			continue
+		}
+		if !found || v.UpdatedAt.After(best.UpdatedAt) {
+			best = v
+			found = true
+		}
+	}
+	return best, found
 }
 
 func (s *sessionStore) upsert(v conversation) conversation {

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -70,18 +71,22 @@ type Result struct {
 	Events         []json.RawMessage
 	Normalized     []Event
 	Images         []string
+	// WarmHit is true when the WebSocket was upgraded over a pre-established
+	// TLS connection taken from the warmup pool (a cold-start cache hit).
+	WarmHit bool
 }
 
 type Client struct {
 	HTTPHeader http.Header
 	Dialer     *websocket.Dialer
+	pool       *tlsConnPool
 }
 
 func NewClient() *Client {
 	h := make(http.Header)
 	h.Set("Origin", "https://m365.cloud.microsoft")
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
-	return &Client{
+	c := &Client{
 		HTTPHeader: h,
 		Dialer: &websocket.Dialer{
 			HandshakeTimeout: 20 * time.Second,
@@ -98,6 +103,20 @@ func NewClient() *Client {
 			},
 		},
 	}
+	if size := warmupPoolSize(); size > 0 {
+		c.pool = newTLSConnPool(size)
+	}
+	return c
+}
+
+// WarmupSize reports how many TLS connections the warmup pool keeps ready
+// (0 when the pool is disabled). Exposed so the admin usage endpoint can show
+// whether cold-start pre-warming is active.
+func (c *Client) WarmupSize() int {
+	if c.pool == nil {
+		return 0
+	}
+	return c.pool.size
 }
 
 func (c *Client) Chat(ctx context.Context, acc Account, req Request) (Result, error) {
@@ -155,7 +174,32 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	if err != nil {
 		return Result{}, fmt.Errorf("proxy dialer: %w", err)
 	}
+
+	// For direct (non-proxied) accounts, hand gorilla a pre-established TLS
+	// connection from the warmup pool so it skips DNS + TCP + TLS. Proxied
+	// accounts keep their existing tunnel dialer untouched.
+	var warmHit bool
+	if acc.Proxy == "" && c.pool != nil {
+		dialer.NetDialTLSContext = func(ctx2 context.Context, network, addr string) (net.Conn, error) {
+			if cc, hit := c.pool.get(); hit {
+				warmHit = true
+				return cc, nil
+			}
+			return dialTLS(ctx2)
+		}
+	}
+
 	conn, _, err := dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+	if err != nil && warmHit {
+		// The warm TLS connection may have died silently between being
+		// parked and being used. Retry once with a fresh (non-pooled) TLS
+		// dial so a single stale connection never fails a request.
+		warmHit = false
+		dialer.NetDialTLSContext = func(ctx2 context.Context, network, addr string) (net.Conn, error) {
+			return dialTLS(ctx2)
+		}
+		conn, _, err = dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+	}
 	if err != nil {
 		return Result{}, fmt.Errorf("ws dial: %w", err)
 	}
@@ -380,6 +424,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					Events:         events,
 					Normalized:     NormalizeEvents(events),
 					Images:         imageURLs(events),
+					WarmHit:        warmHit,
 				}, nil
 			}
 		}

@@ -14,6 +14,10 @@ services:
       M365_CHAT_TIMEOUT_SECONDS: "120"
       M365_IMAGE_TIMEOUT_SECONDS: "150"
       M365_LOG_LEVEL: "silent"
+      # Cold-start pre-warming: keep N TLS connections to ChatHub ready so the
+      # hot path skips DNS+TCP+TLS (single-use connections are still closed
+      # after each chat; only the expensive TLS setup is reused). 0 disables.
+      M365_WARMUP: "2"
     volumes:
       - ./data:/data
       - ./secrets/m365_admin_password:/run/secrets/m365_admin_password:ro
