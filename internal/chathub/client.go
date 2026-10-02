@@ -1,6 +1,7 @@
 package chathub
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -208,6 +209,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	seenStreamTools := map[string]bool{}
 
 	deadline := time.Now().Add(5 * time.Minute)
+	// frameBuf accumulates raw bytes across WebSocket messages. A multi-byte
+	// UTF-8 glyph (e.g. a CJK character) can land on a WebSocket frame boundary,
+	// so splitting each ReadMessage() result independently would feed
+	// json.Unmarshal a truncated string and silently drop the tail as mojibake.
+	// Buffering across reads keeps every JSON record byte-complete before parse.
+	var frameBuf []byte
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -221,7 +228,8 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			// partial response. A response is complete only after SignalR type 3.
 			return Result{}, fmt.Errorf("ws read before completion: %w", err)
 		}
-		for _, part := range strings.Split(string(msg), rs) {
+		frameBuf = append(frameBuf, msg...)
+		for _, part := range extractFrames(&frameBuf) {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
@@ -291,7 +299,25 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							author, _ := m["author"].(string)
 							text, _ := m["text"].(string)
 							mt, _ := m["messageType"].(string)
-							if author == "bot" && mt == "" && text != "" {
+							ct, _ := m["contentType"].(string)
+							hidden, _ := m["hiddenFromUser"].(bool)
+							hiddenText, _ := m["hiddenText"].(string)
+							// ChatHub streams the model's internal reasoning under
+							// hidden/internal message types. Surface it as a
+							// reasoning_content delta so reasoning models stream
+							// their thinking instead of discarding it.
+							if onEvent != nil {
+								if hiddenText != "" {
+									_ = onEvent(StreamEvent{Kind: "reasoning", Text: hiddenText})
+								}
+								if author == "bot" && hidden && text != "" {
+									_ = onEvent(StreamEvent{Kind: "reasoning", Text: text})
+								}
+								if (mt == "Reasoning" || mt == "Thought" || mt == "Internal" || ct == "Reasoning" || ct == "Thought") && text != "" {
+									_ = onEvent(StreamEvent{Kind: "reasoning", Text: text})
+								}
+							}
+							if author == "bot" && mt == "" && text != "" && !hidden {
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
 								deltas = append(deltas, text)
@@ -363,6 +389,34 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
+}
+
+// extractFrames splits a SignalR byte stream on the record separator (rs, 0x1e)
+// into complete JSON records. It mutates buf in place: every terminated record is
+// removed and returned, while any trailing bytes without a terminator (a record
+// that spans a WebSocket frame boundary) are retained for the next call. Records
+// that are neither empty nor a valid JSON prefix are discarded so a malformed
+// frame cannot stall the stream.
+func extractFrames(buf *[]byte) []string {
+	var out []string
+	for {
+		i := bytes.IndexByte(*buf, 0x1e)
+		if i < 0 {
+			break
+		}
+		out = append(out, string((*buf)[:i]))
+		*buf = (*buf)[i+1:]
+	}
+	if len(*buf) > 0 {
+		trimmed := bytes.TrimSpace(*buf)
+		// Keep only a plausible JSON prefix (starts with '{'); drop junk or
+		// already-complete-but-unterminated frames so the buffer cannot grow
+		// unbounded on a never-terminated record.
+		if len(trimmed) == 0 || trimmed[0] != '{' || json.Valid(*buf) {
+			*buf = (*buf)[:0]
+		}
+	}
+	return out
 }
 
 func buildWSURL(acc Account, sessionID, conversationID, requestID string) (string, error) {

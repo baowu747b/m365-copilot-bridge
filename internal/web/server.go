@@ -1278,6 +1278,18 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		first := true
 		var streamedTools []detectedToolCall
 		res2, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
+			if ev.Kind == "reasoning" && ev.Text != "" {
+				delta := map[string]any{"reasoning_content": ev.Text}
+				if first {
+					delta["role"] = "assistant"
+					first = false
+				}
+				chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
+				if err := sseRaw(r.Context(), w, flusher, "data: "+mustJSON(chunk)+"\n\n"); err != nil {
+					return err
+				}
+				return nil
+			}
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
 				return nil
@@ -1387,11 +1399,28 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
 		firstDelta := true
-		emit := func(content string) error {
-			delta := map[string]any{"content": content}
+		// Forward upstream text deltas as OpenAI content chunks and internal
+		// reasoning frames as reasoning_content chunks. ChatWithEvents exposes
+		// both kinds, replacing the previous hardcoded placeholder reasoning.
+		handle := func(ev chathub.StreamEvent) error {
+			var delta map[string]any
+			switch ev.Kind {
+			case "reasoning":
+				if ev.Text == "" {
+					return nil
+				}
+				delta = map[string]any{"reasoning_content": ev.Text}
+			case "text":
+				if ev.Text == "" {
+					return nil
+				}
+				delta = map[string]any{"content": ev.Text}
+			default:
+				return nil
+			}
 			if firstDelta {
+				delta["role"] = "assistant"
 				firstDelta = false
-				delta = map[string]any{"content": nil, "reasoning_content": "正在分析请求并准备回答……"}
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
 			if err := sseRaw(r.Context(), w, flusher, "data: "+mustJSON(chunk)+"\n\n"); err != nil {
@@ -1405,7 +1434,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
 			return
 		}
-		res, err = s.chat.ChatWithDelta(ctx, account, answerReq, emit)
+		res, err = s.chat.ChatWithEvents(ctx, account, answerReq, handle)
 		if err == nil {
 			if err := sseFinishChunk(r.Context(), w, flusher, id, model, "stop"); err != nil {
 				return
