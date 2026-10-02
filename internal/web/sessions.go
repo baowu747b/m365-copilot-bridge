@@ -96,6 +96,34 @@ func (s *sessionStore) getByContentKey(accountID, key string) (conversation, boo
 	return best, found
 }
 
+// getByContentKeyAny returns the most recent conversation bound to key across
+// ALL accounts while still within contentKeyTTL. It is used to pin a request to
+// the account that owns a content key BEFORE account resolution, so the
+// round-robin allocator does not split reuse across different accounts (which
+// would make getByContentKey miss and defeat the cache).
+func (s *sessionStore) getByContentKeyAny(key string) (conversation, bool) {
+	if key == "" {
+		return conversation{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best conversation
+	found := false
+	for _, v := range s.data {
+		if v.ContentKey != key {
+			continue
+		}
+		if time.Since(v.UpdatedAt) > contentKeyTTL {
+			continue
+		}
+		if !found || v.UpdatedAt.After(best.UpdatedAt) {
+			best = v
+			found = true
+		}
+	}
+	return best, found
+}
+
 func (s *sessionStore) upsert(v conversation) conversation {
 	s.mu.Lock()
 	defer s.mu.Unlock()

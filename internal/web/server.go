@@ -955,6 +955,14 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
 		}
 	}
+	// Pin to the account that owns this content key (if any) BEFORE account
+	// resolution, so the round-robin allocator cannot split reuse across
+	// accounts. The post-resolution block below then reuses the conversation.
+	if body.ContentKey != "" && body.SessionKey == "" {
+		if v, ok := s.sessions.getByContentKeyAny(body.ContentKey); ok {
+			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
+		}
+	}
 	acc, err := s.resolveAccount(body.AccountID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1226,6 +1234,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
+		}
+	}
+	// Pin to the account that owns this content key (if any) before account
+	// resolution, so round-robin does not split reuse across accounts.
+	if body.ContentKey != "" && body.SessionKey == "" {
+		if v, ok := s.sessions.getByContentKeyAny(body.ContentKey); ok {
+			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 		}
 	}
 	accountID := firstNonEmpty(body.AccountID, body.User)

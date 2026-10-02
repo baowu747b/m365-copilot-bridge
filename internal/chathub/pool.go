@@ -3,6 +3,7 @@ package chathub
 import (
 	"context"
 	"crypto/tls"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -53,6 +54,9 @@ func newTLSConnPool(size int) *tlsConnPool {
 		stop:   make(chan struct{}),
 	}
 	if size > 0 {
+		// The initial warm-up runs inside the maintainer goroutine so it never
+		// delays server startup; the first few requests simply fall back to a
+		// fresh dial until the pool is populated.
 		go p.maintain()
 	}
 	return p
@@ -108,9 +112,43 @@ func (p *tlsConnPool) put(c *tls.Conn) {
 	p.mu.Unlock()
 }
 
+// fill prunes expired idle connections and then tops the reserve back up to
+// size. It must be called with no lock held (it takes p.mu internally and may
+// briefly block on a TLS dial). Pruning first is what keeps the pool useful:
+// without it, a full reserve of stale connections would suppress refilling and
+// every get() would close-and-miss them.
+func (p *tlsConnPool) fill() {
+	if p == nil || p.size <= 0 {
+		return
+	}
+	p.mu.Lock()
+	kept := p.idle[:0]
+	for _, pc := range p.idle {
+		if time.Since(pc.born) > p.maxAge {
+			pc.conn.Close()
+			continue
+		}
+		kept = append(kept, pc)
+	}
+	p.idle = kept
+	need := p.size - len(p.idle)
+	p.mu.Unlock()
+	for i := 0; i < need; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		c, err := dialTLS(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("m365-native: warmup pool fill failed (endpoint unreachable?): %v", err)
+			break
+		}
+		p.put(c)
+	}
+}
+
 // maintain tops the reserve back up on a timer. If the endpoint is
 // unreachable it simply retries on the next tick; it never blocks startup.
 func (p *tlsConnPool) maintain() {
+	p.fill() // initial warm-up inside the goroutine, not blocking NewClient
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -124,18 +162,7 @@ func (p *tlsConnPool) maintain() {
 			p.mu.Unlock()
 			return
 		case <-ticker.C:
-			p.mu.Lock()
-			need := p.size - len(p.idle)
-			p.mu.Unlock()
-			for i := 0; i < need; i++ {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				c, err := dialTLS(ctx)
-				cancel()
-				if err != nil {
-					break
-				}
-				p.put(c)
-			}
+			p.fill()
 		}
 	}
 }
