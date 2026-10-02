@@ -960,7 +960,13 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	// accounts. The post-resolution block below then reuses the conversation.
 	if body.ContentKey != "" && body.SessionKey == "" {
 		if v, ok := s.sessions.getByContentKeyAny(body.ContentKey); ok {
-			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
+			// Only pin to the owner account when it is currently healthy.
+			// Otherwise leave accountID empty so resolveAccount falls through
+			// to round-robin failover instead of locking the request onto a
+			// dead account (P1 from the 2026-10-02 review).
+			if s.healthPool().Available(v.AccountID) {
+				body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
+			}
 		}
 	}
 	acc, err := s.resolveAccount(body.AccountID)
@@ -1240,7 +1246,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// resolution, so round-robin does not split reuse across accounts.
 	if body.ContentKey != "" && body.SessionKey == "" {
 		if v, ok := s.sessions.getByContentKeyAny(body.ContentKey); ok {
-			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
+			// Only pin to the owner account when it is currently healthy.
+			// Otherwise leave accountID empty so resolveAccount falls through
+			// to round-robin failover instead of locking the request onto a
+			// dead account (P1 from the 2026-10-02 review).
+			if s.healthPool().Available(v.AccountID) {
+				body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
+			}
 		}
 	}
 	accountID := firstNonEmpty(body.AccountID, body.User)
