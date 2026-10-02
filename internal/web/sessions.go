@@ -22,9 +22,10 @@ type conversation struct {
 }
 
 type sessionStore struct {
-	mu   sync.Mutex
-	path string
-	data map[string]conversation
+	mu     sync.Mutex
+	saveMu sync.Mutex
+	path   string
+	data   map[string]conversation
 }
 
 func openSessionStore() *sessionStore {
@@ -45,6 +46,14 @@ func openSessionStore() *sessionStore {
 // both blocked reads and made every upsert an O(N) disk write that degraded to
 // O(N^2) as the table grew (P0 from the 2026-10-02 review).
 func (s *sessionStore) save() {
+	// Serialize saves with a dedicated mutex: the hot path copies under s.mu
+	// then writes outside it, but two concurrent saves could otherwise copy
+	// at different instants and the later write (from an older snapshot)
+	// could land after the newer one and roll the table back (P2, 2026-10-02
+	// review, S4.2). Holding saveMu for the whole copy+write makes saves
+	// atomic with respect to each other.
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
 	s.mu.Lock()
 	cp := make(map[string]conversation, len(s.data))
 	for k, v := range s.data {

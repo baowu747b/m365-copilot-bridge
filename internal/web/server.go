@@ -1005,7 +1005,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	var inTok, outTok int64
 	defer func() {
 		if s.metrics != nil {
-			s.metrics.record(chatStatus, time.Since(start).Milliseconds(), "m365-copilot", acc.ID, inTok, outTok, warm, reuseHit, body.ContentKey != "" && !reuseHit)
+			s.metrics.record(chatStatus, time.Since(start).Milliseconds(), "m365-copilot", acc.ID, inTok, outTok, warm, acc.Proxy == "", reuseHit, body.ContentKey != "" && !reuseHit)
 		}
 	}()
 
@@ -1287,7 +1287,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	var inTok, outTok int64
 	defer func() {
 		if s.metrics != nil {
-			s.metrics.record(chatStatus, time.Since(start).Milliseconds(), firstNonEmpty(body.Model, "m365-copilot"), acc.ID, inTok, outTok, warm, reuseHit, body.ContentKey != "" && !reuseHit)
+			s.metrics.record(chatStatus, time.Since(start).Milliseconds(), firstNonEmpty(body.Model, "m365-copilot"), acc.ID, inTok, outTok, warm, acc.Proxy == "", reuseHit, body.ContentKey != "" && !reuseHit)
 		}
 	}()
 
@@ -1593,15 +1593,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if res.Throttling != nil {
 		s.healthPool().MarkRateLimited(acc.ID, time.Time{})
 	}
-	if body.ContentKey != "" {
+	if body.SessionKey != "" {
+		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt, ContentKey: body.ContentKey})
+	} else if body.ContentKey != "" {
 		s.sessions.upsert(conversation{AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt, ContentKey: body.ContentKey})
 	}
 	if body.Stream {
 		return
-	}
-
-	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
 	model := body.Model
 	if model == "" {

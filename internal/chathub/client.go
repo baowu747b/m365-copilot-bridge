@@ -351,14 +351,27 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							// reasoning_content delta so reasoning models stream
 							// their thinking instead of discarding it.
 							if onEvent != nil {
+								// Collect every candidate reasoning string, then emit each
+								// distinct one exactly once. The three upstream conditions can
+								// all match the same message, so emitting per-condition would
+								// duplicate the model's thinking (P1, 2026-10-02 review).
+								var reasons []string
 								if hiddenText != "" {
-									_ = onEvent(StreamEvent{Kind: "reasoning", Text: hiddenText})
+									reasons = append(reasons, hiddenText)
 								}
 								if author == "bot" && hidden && text != "" {
-									_ = onEvent(StreamEvent{Kind: "reasoning", Text: text})
+									reasons = append(reasons, text)
 								}
 								if (mt == "Reasoning" || mt == "Thought" || mt == "Internal" || ct == "Reasoning" || ct == "Thought") && text != "" {
-									_ = onEvent(StreamEvent{Kind: "reasoning", Text: text})
+									reasons = append(reasons, text)
+								}
+								seen := make(map[string]bool, len(reasons))
+								for _, r := range reasons {
+									if r == "" || seen[r] {
+										continue
+									}
+									seen[r] = true
+									_ = onEvent(StreamEvent{Kind: "reasoning", Text: r})
 								}
 							}
 							if author == "bot" && mt == "" && text != "" && !hidden {
@@ -454,12 +467,24 @@ func extractFrames(buf *[]byte) []string {
 	}
 	if len(*buf) > 0 {
 		trimmed := bytes.TrimSpace(*buf)
-		// Keep only a plausible JSON prefix (starts with '{'); drop junk or
-		// already-complete-but-unterminated frames so the buffer cannot grow
-		// unbounded on a never-terminated record.
-		if len(trimmed) == 0 || trimmed[0] != '{' || json.Valid(*buf) {
+		if len(trimmed) == 0 {
+			// Whitespace only - nothing to keep.
+			*buf = (*buf)[:0]
+		} else if trimmed[0] != '{' {
+			// Junk that can never become valid JSON - drop it so the buffer
+			// cannot grow unbounded on a never-terminated record.
+			*buf = (*buf)[:0]
+		} else if json.Valid(trimmed) {
+			// Trailing fragment is a complete, standalone JSON record (the
+			// stream ended or this is the final frame without a 0x1e terminator).
+			// Emit it instead of discarding it - otherwise the client hard-waits
+			// for a terminator that never arrives and the request stalls until
+			// timeout (P2, 2026-10-02 review).
+			out = append(out, string(trimmed))
 			*buf = (*buf)[:0]
 		}
+		// else: an incomplete JSON prefix starting with '{' - retain it for
+		// the next call.
 	}
 	return out
 }

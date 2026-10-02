@@ -23,11 +23,12 @@ const warmupTargetHost = "substrate.office.com:443"
 // fully compatible with ChatHub's single-use connection constraint. The only
 // thing we reuse is the expensive DNS + TCP + TLS setup.
 type tlsConnPool struct {
-	mu     sync.Mutex
-	idle   []*pooledTLS
-	size   int
-	maxAge time.Duration
-	stop   chan struct{}
+	mu       sync.Mutex
+	idle     []*pooledTLS
+	size     int
+	maxAge   time.Duration
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 type pooledTLS struct {
@@ -168,9 +169,11 @@ func (p *tlsConnPool) maintain() {
 }
 
 // Stop terminates the maintainer goroutine and closes idle connections.
+// It is safe to call multiple times: sync.Once guards the channel close so a
+// second call cannot panic on a double close (P3, 2026-10-02 review).
 func (p *tlsConnPool) Stop() {
 	if p == nil {
 		return
 	}
-	close(p.stop)
+	p.stopOnce.Do(func() { close(p.stop) })
 }

@@ -39,12 +39,12 @@ const maxSamples = 4000
 
 // record is called once per inbound chat request after it settles. warm reports
 // a warmup-pool TLS hit; reuseHit/reuseMiss report content-key session reuse.
-func (t *telemetry) record(status int, ms int64, model, account string, in, out int64, warm, reuseHit, reuseMiss bool) {
+func (t *telemetry) record(status int, ms int64, model, account string, in, out int64, warm, direct, reuseHit, reuseMiss bool) {
 	if t == nil {
 		return
 	}
 	t.requests.Add(1)
-	if status >= 200 && status < 500 {
+	if status >= 200 && status < 400 {
 		t.ok.Add(1)
 	} else {
 		t.errs.Add(1)
@@ -52,10 +52,15 @@ func (t *telemetry) record(status int, ms int64, model, account string, in, out 
 	t.latencyMs.Add(ms)
 	t.tokensIn.Add(in)
 	t.tokensOut.Add(out)
-	if warm {
-		t.warmHits.Add(1)
-	} else {
-		t.warmMiss.Add(1)
+	// warm statistics only count direct (non-proxy) accounts: the warmup pool
+	// only serves direct connections, so proxy-account requests are always
+	// misses and would dilute warmHitRate (P2, 2026-10-02 review).
+	if direct {
+		if warm {
+			t.warmHits.Add(1)
+		} else {
+			t.warmMiss.Add(1)
+		}
 	}
 	if reuseHit {
 		t.reuseHits.Add(1)
@@ -113,7 +118,7 @@ func (s *Server) adminUsage(w http.ResponseWriter, r *http.Request) {
 			buckets[key] = b
 		}
 		b.Requests++
-		if sm.status >= 200 && sm.status < 500 {
+		if sm.status >= 200 && sm.status < 400 {
 			b.Ok++
 		} else {
 			b.Err++
