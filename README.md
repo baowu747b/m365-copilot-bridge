@@ -188,7 +188,7 @@ curl http://127.0.0.1:4141/v1/chat/completions \
 
 基于另一 AI 的独立复核（变更复核报告-第二轮）逐条源码核对后落地。本次覆盖 5 个文件、修复 6 项：
 
-1. **P1 reasoning 三重 emit 重复**（`internal/chathub/client.go`）：上游三种隐藏思考的判定条件会同时命中同一条消息，原逻辑三处独立 `if` 各发一次 → 思考内容被重复两遍。改为「收集候选 → 去重 → 每条 distinct 只发一次。
+1. **P1 reasoning 三重 emit 重复**（`internal/chathub/client.go`）：上游三种隐藏思考的判定条件会同时命中同一条消息，原逻辑三处独立 `if` 各发一次 → 思考内容被重复两遍。改为「收集候选 → 去重 → 每条 distinct 只发一次。」
 2. **P2 extractFrames 静默丢完整帧**（`client.go`）：末帧若是合法完整 JSON（`json.Valid`）会被直接清空 buf 丢弃，导致客户端硬等超时。改为合法完整帧也作为一帧返回。
 3. **P2 telemetry 口径**（`internal/web/telemetry.go` + `server.go`）：① 4xx 不再算成功（`status<400`）；② warm 命中率分母排除代理账号（仅直连账号计入 `warmHits`/`warmMiss`），`warmHitRate` 不再被 24 个代理账号稀释。
 4. **P3 Stop() 二次 close panic**（`internal/chathub/pool.go`）：`close(p.stop)` 重复调用必崩，加 `sync.Once` 保护。
